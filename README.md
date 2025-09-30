@@ -46,4 +46,5 @@ streamlit run app.py
 
 Deployed on Streamlit Community Cloud
 
-👉 App link: (fill this in once deployed)
+👉 App link: [jayhagewood/greenbelt-proto](https://greenbelt-proto-v1.streamlit.app/)
+
