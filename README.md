@@ -41,3 +41,9 @@ conda create -n city python=3.10 -y
 conda activate city
 pip install -r requirements.txt
 streamlit run app.py
+
+🌐 Live Demo
+
+Deployed on Streamlit Community Cloud
+
+👉 App link: (fill this in once deployed)
