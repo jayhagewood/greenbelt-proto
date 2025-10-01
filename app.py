@@ -1,25 +1,19 @@
-# app.py — City ADOS & Equity Context (with BLUF panel)
+# app.py — City ADOS & Equity Context (Cloud-safe with boundary fallback)
 # =============================================================================
 # Phase 1:
-#   - City boundary (OSM/Nominatim)
-#   - ACS B05003B ADOS-proxy (Native-born Black alone) by tract → city
-#   - Wealth/Health indicators (ACS + CDC PLACES)
-#   - PG County Socrata samplers (311, Code, Crime)
-#   - Optional: Maryland Socrata domain slot
+#   - City boundary: OSM/Nominatim (primary) with Census Places (TIGER) fallback
+#   - ACS B05003B ADOS-proxy (U.S.-born Black alone) by tract → city
+#   - Wealth & Health indicators (ACS + CDC PLACES)
+#   - PG County Socrata samplers (311, Code, Crime) + optional MD portal slot
+#   - BLUF (30s) panel + robust charting, pydeck polygon map
 # Phase 2:
-#   - Update buttons to fetch/prepare HUD CHAS (place), LODES (RAC), PUMS (ADOS by PUMA)
-#   - Auto-detect & display outputs when present
-# Fixes:
-#   - Robust PLACES loader + safe merge
-#   - pydeck GeoJsonLayer mapping for polygon
-#   - Arrow-friendly dataframes (drop raw geometry in tables)
-#   - BLUF (30s) panel + smart fallbacks for missing/fragile metrics
+#   - Update buttons for HUD CHAS (place), LODES (RAC), PUMS (ADOS by PUMA)
+#   - Auto-detect results and preview
 # =============================================================================
 
 import os
 import io
 import zipfile
-import gzip
 import shutil
 from pathlib import Path
 
@@ -32,14 +26,14 @@ import streamlit as st
 import geopandas as gpd
 from shapely.geometry import Point, shape
 
-# Charts / Map
+# Viz
 import altair as alt
 import pydeck as pdk
 
 st.set_page_config(page_title="City ADOS & Equity Context — Prototype", layout="wide")
 
 # ---------------------------
-# Sidebar (BLUF-friendly labels)
+# Sidebar (config)
 # ---------------------------
 st.sidebar.header("Config")
 
@@ -47,6 +41,13 @@ CITY_NAME   = st.sidebar.text_input("City Name", "Greenbelt, Maryland, USA")
 STATE_FIPS  = st.sidebar.text_input("State Code (FIPS)", "24")       # Maryland = 24
 COUNTY_FIPS = st.sidebar.text_input("County Code (FIPS)", "033")     # Prince George's = 033
 ACS_YEAR    = st.sidebar.selectbox("ACS Data Year (5-yr)", ["2023", "2022", "2021"], index=0)
+
+BOUNDARY_SOURCE = st.sidebar.selectbox(
+    "Boundary source",
+    ["Auto (OSM→Census)", "OSM (Nominatim)", "Census Places (TIGER)"],
+    index=0,
+    help="If OSM is blocked on Streamlit Cloud, pick Census Places"
+)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Socrata Open Data")
@@ -57,35 +58,70 @@ PG_DATASETS = {
     "Crime Reports – Current":  st.sidebar.text_input("Crime current id", "xjru-idbe"),
     "Crime Reports – Past":     st.sidebar.text_input("Crime historic id", "wb4e-w4nf"),
 }
-
-# Optional second Socrata domain (e.g., Maryland Open Data)
 SOCRATA_DOMAIN_MD_OPT = st.sidebar.text_input("Optional Socrata domain (e.g., opendata.maryland.gov)", "")
-
 MAX_ROWS = st.sidebar.slider("Max Rows per Dataset", 10_000, 100_000, 50_000, step=10_000)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Tip: Works for any U.S. city that OSM has a polygon for.")
 
 # ---------------------------
 # Helpers (cached)
 # ---------------------------
 
 @st.cache_data(show_spinner=True, ttl=60*60*24)
-def get_city_boundary_from_overpass(place_name: str) -> gpd.GeoDataFrame:
+def get_city_boundary_from_overpass(place_name: str, contact_email: str = "contact@example.com") -> gpd.GeoDataFrame:
+    """Fetch city polygon from OSM/Nominatim. Raises on failure."""
     nom = requests.get(
         "https://nominatim.openstreetmap.org/search",
         params={"q": place_name, "format": "json", "polygon_geojson": 1, "limit": 1, "addressdetails": 0},
-        headers={"User-Agent": "city-boundary-prototype/1.0"},
-        timeout=60,
+        headers={"User-Agent": f"city-boundary-prototype/1.0 ({contact_email})"},
+        timeout=20,
     )
     nom.raise_for_status()
     j = nom.json()
-    if not j:
-        raise RuntimeError(f"Boundary not found for '{place_name}'. Try a different spelling.")
-    gj = j[0].get("geojson")
+    if not j or "geojson" not in j[0]:
+        raise RuntimeError(f"OSM boundary not found for '{place_name}'.")
+    gj = j[0]["geojson"]
     gdf = gpd.GeoDataFrame({"name": [place_name]}, geometry=[shape(gj)], crs="EPSG:4326")
-    gdf["geometry"] = gdf["geometry"].buffer(0)  # fix invalid multipolygons if any
+    gdf["geometry"] = gdf["geometry"].buffer(0)
     return gdf
+
+@st.cache_data(show_spinner=True, ttl=60*60*24)
+def get_city_boundary_from_census_places(place_name: str, state_fips: str) -> gpd.GeoDataFrame:
+    """
+    Fallback: use Census TIGER cartographic 'places' (national) and filter by state + name.
+    Works reliably on Streamlit Cloud.
+    """
+    url = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_place_500k.zip"
+    places = gpd.read_file(url).to_crs("EPSG:4326")  # columns include: NAME, NAMELSAD, STATEFP, GEOID, geometry
+    places = places[places["STATEFP"] == str(state_fips).zfill(2)].copy()
+
+    city_token = place_name.split(",")[0].strip().lower()
+    cand = places[places["NAME"].str.lower().str.contains(city_token, na=False)].copy()
+    if cand.empty:
+        cand = places[places["NAMELSAD"].str.lower().str.contains(city_token, na=False)].copy()
+    if cand.empty:
+        raise RuntimeError(f"Census Places: no match for '{place_name}' in state FIPS {state_fips}.")
+
+    cand["score"] = 0
+    cand.loc[cand["NAMELSAD"].str.contains("city", case=False, na=False), "score"] += 2
+    cand.loc[cand["NAME"].str.lower() == city_token, "score"] += 3
+    cand = cand.sort_values(["score", "NAME"], ascending=[False, True]).head(1)
+
+    cand["name"] = place_name
+    cand["geometry"] = cand["geometry"].buffer(0)
+    return cand[["name", "geometry"]].reset_index(drop=True)
+
+@st.cache_data(show_spinner=True, ttl=60*60*24)
+def get_city_boundary_auto(place_name: str, state_fips: str, source_choice: str) -> gpd.GeoDataFrame:
+    """Auto chooser: OSM first then Census, or force one based on sidebar."""
+    if source_choice == "OSM (Nominatim)":
+        return get_city_boundary_from_overpass(place_name)
+    if source_choice == "Census Places (TIGER)":
+        return get_city_boundary_from_census_places(place_name, state_fips)
+    # Auto: try OSM, fall back to Census
+    try:
+        return get_city_boundary_from_overpass(place_name)
+    except Exception as e:
+        st.warning(f"OSM boundary fetch failed, using Census Places fallback. Details: {e}")
+        return get_city_boundary_from_census_places(place_name, state_fips)
 
 @st.cache_data(show_spinner=True, ttl=60*60*24)
 def get_census_group_metadata(year: str, group: str = "B05003B"):
@@ -194,15 +230,14 @@ def subset_to_city_tracts(tract_df: pd.DataFrame, tracts_gdf: gpd.GeoDataFrame, 
 @st.cache_data(show_spinner=True, ttl=60*60*24)
 def get_cdc_places_tract(level_year: str = "2023"):
     """
-    CDC PLACES tract-level indicators (GIS-friendly CSV).
-    Returns two columns guaranteed: ['geoid_tract','uninsured_18_64_pct'] (may be empty).
+    CDC PLACES tract-level (GIS-friendly). Returns columns: ['geoid_tract','uninsured_18_64_pct'] (may be empty).
     """
     url = "https://chronicdata.cdc.gov/api/views/cwsq-ngmh/rows.csv?accessType=DOWNLOAD"  # 2023 PLACES Tract GIS-friendly
     r = requests.get(url, timeout=180)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text), low_memory=False)
 
-    # Construct GEOID from several possible fields (preserve 11 digits)
+    # Build GEOID
     geoid_series = None
     for cand in ["TractFIPS", "TractFIPS10", "LocationID"]:
         if cand in df.columns:
@@ -218,7 +253,7 @@ def get_cdc_places_tract(level_year: str = "2023"):
                     geoid_series = s.str.zfill(11)
                     break
 
-    # Filter to uninsured 18–64
+    # Uninsured (18–64)
     if "Measure" in df.columns and "Data_Value" in df.columns:
         df_ins = df[df["Measure"].str.contains("lack of health insurance", case=False, na=False)].copy()
         df_ins.rename(columns={"Data_Value": "uninsured_18_64_pct"}, inplace=True)
@@ -228,7 +263,6 @@ def get_cdc_places_tract(level_year: str = "2023"):
     if geoid_series is not None:
         df_ins["geoid_tract"] = geoid_series.loc[df_ins.index].values
 
-    # Always return canonical columns; may be empty
     return df_ins.reindex(columns=["geoid_tract", "uninsured_18_64_pct"]).dropna(how="all")
 
 def rate(numer, denom):
@@ -248,16 +282,11 @@ def fmtnum(x, pct=False):
     except Exception:
         return "—"
 
-# --- NEW: helpers for BLUF/fallbacks ---
 def safe_mean(series):
-    """Mean that returns np.nan instead of warnings when empty/all-nan."""
     s = pd.to_numeric(series, errors="coerce")
-    if s.notna().any():
-        return float(np.nanmean(s))
-    return np.nan
+    return float(np.nanmean(s)) if s.notna().any() else np.nan
 
 def metric_or_fallback(col, label, value, fmt="num", help_text="", fallback_note="No tract data; use county/CHAS for context"):
-    """Show metric with smart fallback if value is nan."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
         col.metric(label, "—")
         if fallback_note:
@@ -273,27 +302,26 @@ def metric_or_fallback(col, label, value, fmt="num", help_text="", fallback_note
             col.metric(label, f"{value:,.0f}", help=help_text)
 
 # ---------------------------
-# Main App — Phase 1
+# Main App
 # ---------------------------
 st.title("City ADOS & Equity Context — 72-Hour Prototype")
-st.caption("ADOS-proxy (Native-born Black alone) from ACS + optional local/state open data feeds")
+st.caption("ADOS-proxy (U.S.-born Black alone) from ACS + optional local/state open data feeds")
 
+# City boundary (auto with fallback)
 with st.spinner("Fetching city boundary…"):
-    city_gdf = get_city_boundary_from_overpass(CITY_NAME)
+    city_gdf = get_city_boundary_auto(CITY_NAME, STATE_FIPS, BOUNDARY_SOURCE)
 st.success("Loaded city boundary")
 
-# ---- Map the city boundary cleanly (pydeck GeoJson) ----
+# Map boundary with pydeck
 try:
     minx, miny, maxx, maxy = city_gdf.total_bounds
     lon_center = (minx + maxx) / 2
     lat_center = (miny + maxy) / 2
-
     city_geojson = city_gdf.to_json()
     layer = pdk.Layer(
         "GeoJsonLayer",
         data=city_geojson,
-        stroked=True,
-        filled=False,
+        stroked=True, filled=False,
         get_line_color=[20, 120, 240, 200],
         line_width_min_pixels=2,
     )
@@ -301,7 +329,6 @@ try:
     deck = pdk.Deck(layers=[layer], initial_view_state=view, map_style=None)
     st.pydeck_chart(deck)
 except Exception:
-    # Fallback: plot centroid point
     cent = city_gdf.to_crs(4326).copy()
     cent["latitude"] = cent.geometry.centroid.y
     cent["longitude"] = cent.geometry.centroid.x
@@ -322,14 +349,12 @@ with colA:
         acs_df    = get_census_tract_black_nativity(ACS_YEAR, STATE_FIPS, COUNTY_FIPS, "B05003B")
         tracts_gd = get_pg_tract_geometries(STATE_FIPS, COUNTY_FIPS)
 
-    # Spatial intersect: tracts intersecting city
     g_city = city_gdf.to_crs(tracts_gd.crs)
     tr_ = gpd.overlay(tracts_gd, g_city[["geometry"]], how="intersection")
     tr_ids = tr_["geoid_tract"].unique().tolist()
 
     acs_sel = acs_df[acs_df["geoid_tract"].isin(tr_ids)].copy()
 
-    # Aggregate to city
     city_native      = acs_sel["native_black"].sum()
     city_foreign     = acs_sel["foreign_black"].sum()
     city_black_total = acs_sel["black_total"].sum()
@@ -340,7 +365,6 @@ with colA:
     k2.metric("Foreign-born Black residents (est.)", f"{int(city_foreign):,}")
     k3.metric("ADOS proxy (share of Black)", f"{ados_proxy_share:.1%}" if pd.notna(ados_proxy_share) else "—")
 
-    # Tract-level bar (ADOS proxy)
     acs_map = acs_sel.merge(tracts_gd, on="geoid_tract", how="left")
     acs_map = gpd.GeoDataFrame(acs_map, geometry="geometry", crs=tracts_gd.crs)
     acs_map["ados_proxy_share"] = np.where(acs_map["black_total"] > 0,
@@ -372,8 +396,8 @@ with colB:
     st.info(
         "• **ADOS proxy** = U.S.-born Black (alone) from ACS table **B05003B**.\n"
         "• This is a **proxy**, not identity; precise ancestry/parent-nativity needs PUMS (Phase 2).\n"
-        "• Tracts are intersected with the city boundary (OSM); small edge effects possible.\n"
-        "• Results are **indicative** and subject to ACS sampling error (especially tract level)."
+        "• Tracts intersect the city boundary; small edge effects possible.\n"
+        "• Tract ACS has sampling error; treat as indicative, not exact."
     )
     st.caption(f"ACS {ACS_YEAR} 5-yr • State FIPS {STATE_FIPS}, County FIPS {COUNTY_FIPS}")
 
@@ -415,12 +439,11 @@ with col3:
     else:
         st.caption("No rows (or dataset id blank).")
 
-# Optional Maryland portal example (leave IDs blank unless you have one)
 if SOCRATA_DOMAIN_MD_OPT.strip():
     st.markdown("---")
     st.subheader("Optional: Maryland Open Data (custom IDs)")
     st.caption("Enter dataset IDs from the state portal; results will show here if the API shape matches.")
-    # Example placeholder: uncomment if you add an ID
+    # Example placeholder for later:
     # df_md = fetch_socrata(SOCRATA_DOMAIN_MD_OPT, "<dataset_id_here>", MAX_ROWS)
     # if not df_md.empty: st.dataframe(df_md.head(25))
 
@@ -507,35 +530,29 @@ with st.spinner("Loading contextual ACS & PLACES indicators…"):
 st.markdown("---")
 st.header("BLUF: What’s the headline for leadership (30 seconds)")
 
-# Compute safe tract-level means/medians for BLUF KPIs
 med_income = np.nanmedian(acs_city["median_income"])     if "median_income"     in acs_city else np.nan
 med_home   = np.nanmedian(acs_city["median_home_value"]) if "median_home_value" in acs_city else np.nan
 med_rent   = np.nanmedian(acs_city["median_gross_rent"]) if "median_gross_rent" in acs_city else np.nan
 
-asset_part = safe_mean(acs_city.get("asset_income_rate", np.nan))   # 0–1
-no_vehicle = safe_mean(acs_city.get("no_vehicle_rate", np.nan))     # 0–1
-unemp_rate = safe_mean(acs_city.get("unemp_rate", np.nan))          # 0–1
-black_pov  = safe_mean(acs_city.get("black_poverty_rate", np.nan))  # 0–1 (may be nan if unavailable)
-uninsured  = safe_mean(acs_city.get("uninsured_18_64_pct", np.nan)) # already a percent value (0–100), may be nan
+asset_part = safe_mean(acs_city.get("asset_income_rate", np.nan))
+no_vehicle = safe_mean(acs_city.get("no_vehicle_rate", np.nan))
+unemp_rate = safe_mean(acs_city.get("unemp_rate", np.nan))
+black_pov  = safe_mean(acs_city.get("black_poverty_rate", np.nan))
+uninsured  = safe_mean(acs_city.get("uninsured_18_64_pct", np.nan))  # already 0–100 scale
 
-# Price-to-income (higher = harder to buy)
 price_to_income = (med_home / med_income) if (pd.notna(med_home) and pd.notna(med_income) and med_income > 0) else np.nan
-# Rent burden (typical rent as % of typical monthly income)
-rent_burden = (med_rent / (med_income/12.0)) if (pd.notna(med_rent) and pd.notna(med_income) and med_income > 0) else np.nan
+rent_burden     = (med_rent / (med_income/12.0)) if (pd.notna(med_rent) and pd.notna(med_income) and med_income > 0) else np.nan
 
-# Simple vulnerability index (0–100): normalize “strain” signals
 signals = []
 uninsured_01 = uninsured/100.0 if pd.notna(uninsured) else np.nan
-signals.append(no_vehicle)                                                # 0–1
-signals.append(unemp_rate)                                                # 0–1
-signals.append(1 - asset_part if pd.notna(asset_part) else np.nan)        # lack of asset participation
-signals.append(min(rent_burden/0.30, 2.0) / 2.0 if pd.notna(rent_burden) else np.nan)  # >30% burden scaled
+signals.append(no_vehicle)
+signals.append(unemp_rate)
+signals.append(1 - asset_part if pd.notna(asset_part) else np.nan)
+signals.append(min(rent_burden/0.30, 2.0) / 2.0 if pd.notna(rent_burden) else np.nan)
 signals.append(uninsured_01 if pd.notna(uninsured_01) else np.nan)
-
 sig = pd.to_numeric(pd.Series(signals), errors="coerce")
 vulnerability_index = float(np.nanmean(sig) * 100.0) if sig.notna().any() else np.nan
 
-# Headline composite
 hcol = st.columns(1)[0]
 metric_or_fallback(
     hcol, "Community Vulnerability (composite)", vulnerability_index,
@@ -543,46 +560,32 @@ metric_or_fallback(
     help_text="0–100 composite (higher = greater strain): no vehicle, unemployment, lack of asset income, rent burden, uninsured"
 )
 
-# Row 1
 b1, b2, b3 = st.columns(3)
-metric_or_fallback(
-    b1, "Wealth participation", asset_part, fmt="pct",
-    help_text="Share of households with interest/dividends/rent income (wealth proxy)"
-)
-metric_or_fallback(
-    b2, "Home price-to-income", price_to_income, fmt="ratio",
-    help_text="Median home value divided by median household income (higher = harder to buy)"
-)
-metric_or_fallback(
-    b3, "Rent burden (typical)", rent_burden, fmt="pct",
-    help_text="Median rent as % of median monthly income (≥30% = burdened)"
-)
+metric_or_fallback(b1, "Wealth participation", asset_part, fmt="pct",
+                   help_text="Share of households with interest/dividends/rent income (wealth proxy)")
+metric_or_fallback(b2, "Home price-to-income", price_to_income, fmt="ratio",
+                   help_text="Median home value divided by median household income (higher = harder to buy)")
+metric_or_fallback(b3, "Rent burden (typical)", rent_burden, fmt="pct",
+                   help_text="Median rent as % of median monthly income (≥30% = burdened)")
 
-# Row 2
 c1, c2, c3 = st.columns(3)
-metric_or_fallback(
-    c1, "Mobility constraint", no_vehicle, fmt="pct",
-    help_text="Households with no vehicle"
-)
-metric_or_fallback(
-    c2, "Adults without health insurance",
-    (uninsured/100.0) if pd.notna(uninsured) else np.nan, fmt="pct",
-    help_text="CDC PLACES estimate for ages 18–64"
-)
-metric_or_fallback(
-    c3, "Black poverty rate", black_pov, fmt="pct",
-    help_text="If blank at tract level, use county/CHAS as fallback"
-)
+metric_or_fallback(c1, "Mobility constraint", no_vehicle, fmt="pct",
+                   help_text="Households with no vehicle")
+metric_or_fallback(c2, "Adults without health insurance",
+                   (uninsured/100.0) if pd.notna(uninsured) else np.nan, fmt="pct",
+                   help_text="CDC PLACES estimate for ages 18–64")
+metric_or_fallback(c3, "Black poverty rate", black_pov, fmt="pct",
+                   help_text="If blank at tract level, use county/CHAS as fallback")
 
 with st.expander("How to read these (plain English)"):
     st.markdown("""
-- **Wealth participation**: percent of households reporting interest/dividends/rent income — a practical wealth proxy.
-- **Home price-to-income**: how many times the median home price exceeds the median household income (higher = harder to buy).
-- **Rent burden**: typical rent as a share of typical monthly income (≥30% is considered burdened).
-- **Mobility constraint**: percent of households without a vehicle (limits access to jobs, childcare, healthcare).
+- **Wealth participation**: % of households with interest/dividends/rent income — practical wealth proxy.
+- **Home price-to-income**: how many times the median home price exceeds median household income (higher = harder to buy).
+- **Rent burden**: typical rent as a share of typical monthly income (≥30% is burdened).
+- **Mobility constraint**: % of households without a vehicle (limits access to jobs/healthcare).
 - **Adults without health insurance**: share of 18–64 without coverage (CDC PLACES).
-- **Black poverty rate**: if blank, tract sample is too small; use county or HUD CHAS city tables.
-- **Community Vulnerability**: a simple composite (0–100) combining the strain signals above to help triage attention.
+- **Black poverty rate**: if blank, tract sample may be too small; use county or HUD CHAS city tables.
+- **Community Vulnerability**: simple composite (0–100) combining strain signals to help triage attention.
 """)
 
 # Relationships: ADOS proxy vs context
@@ -629,11 +632,11 @@ st.info(
     "• **ADOS proxy** = U.S.-born Black (alone) from ACS B05003B (tract level); city totals aggregate intersecting tracts.\n"
     "• Context metrics are tract medians/means (some race-specific where available), not ADOS-only.\n"
     "• **Weighted views** can be added; Phase 2 adds city-level HUD CHAS and strict ADOS via PUMS.\n"
-    "• ACS has sampling error; interpret as indicative, not exact. Prototype generalizes to other cities via OSM."
+    "• ACS has sampling error; interpret as indicative, not exact. Prototype generalizes to other cities via OSM/Census Places."
 )
 
 # =============================================================================
-# Phase 2 — Updater buttons (CHAS, LODES, PUMS) + Auto-detect & render
+# Phase 2 — Updaters (CHAS, LODES, PUMS)
 # =============================================================================
 st.markdown("---")
 st.header("Phase 2: HUD CHAS, LODES, PUMS (Experimental)")
@@ -654,7 +657,6 @@ def update_chas(chas_url: str = "https://www.huduser.gov/portal/sites/default/fi
         return None
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         z.extractall(PHASE2_IN)
-    # find MD CSV
     csv_file = None
     for c in PHASE2_IN.glob("CHAS*MD*.csv"):
         csv_file = c; break
@@ -776,7 +778,7 @@ st.subheader("HUD CHAS (Place) — Greenbelt")
 chas_fp = Path("phase2/outputs/chas_greenbelt.csv")
 if chas_fp.exists():
     chas = pd.read_csv(chas_fp, low_memory=False)
-    st.caption("Official HUD place-level housing needs for **Greenbelt city** (most scrutiny-ready).")
+    st.caption("Official HUD place-level housing needs for **Greenbelt city** (more scrutiny-ready).")
     with st.expander("Preview CHAS rows"):
         st.dataframe(chas.head(25))
 else:
@@ -800,8 +802,6 @@ pums_fp = Path("phase2/outputs/pums_md_puma_ados.csv")
 if pums_fp.exists():
     pums = pd.read_csv(pums_fp)
     st.caption("ACS PUMS aggregated to **PUMA** (coarser than city). Use as context; disclose geography difference.")
-    with st.expander("Preview PUMS PUMA summary"):
-        st.dataframe(pums.head(25))
     try:
         pums_plot = pums.dropna(subset=["ados_share"]).sort_values("ados_share", ascending=False).copy()
         pums_plot["ados_share_pct"] = pums_plot["ados_share"] * 100
