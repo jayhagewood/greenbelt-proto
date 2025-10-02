@@ -287,11 +287,64 @@ def rate(numer, denom):
         return np.where(denom>0, numer/denom, np.nan)
 
 def subset_to_city_tracts(tract_df: pd.DataFrame, tracts_gdf, city_gdf):
+    """
+    Robustly select tracts that belong to the city:
+    1) polygon intersection (preferred)
+    2) if none, use tract centroids inside city
+    3) if still none, lightly buffer city and retry
+    Returns the *rows from tract_df* whose geoid_tract is selected.
+    """
     gpd = _gpd()
-    g_city = city_gdf.to_crs(tracts_gdf.crs)
-    inter = gpd.overlay(tracts_gdf, g_city[["geometry"]], how="intersection")
-    ids = set(inter["geoid_tract"].unique().tolist())
+
+    # Normalize CRS
+    tracts = tracts_gdf.copy().to_crs(4326)
+    city   = city_gdf.copy().to_crs(4326)
+
+    def _by_intersection(city_poly):
+        try:
+            inter = gpd.overlay(tracts, city_poly[["geometry"]], how="intersection", keep_geom_type=False)
+            if not inter.empty and "geoid_tract" in inter.columns:
+                return set(inter["geoid_tract"].unique().tolist())
+        except Exception:
+            pass
+        return set()
+
+    def _by_centroid(city_poly):
+        try:
+            cents = tracts.copy()
+            cents["__cx"] = cents.geometry.centroid.x
+            cents["__cy"] = cents.geometry.centroid.y
+            pts = gpd.GeoDataFrame(
+                cents[["geoid_tract"]].copy(),
+                geometry=gpd.points_from_xy(cents["__cx"], cents["__cy"]),
+                crs=tracts.crs
+            )
+            joined = gpd.sjoin(pts, city_poly[["geometry"]], how="inner", predicate="within")
+            if not joined.empty:
+                return set(joined["geoid_tract"].unique().tolist())
+        except Exception:
+            pass
+        return set()
+
+    # Strategy 1: direct intersection
+    ids = _by_intersection(city)
+    # Strategy 2: centroid-in-polygon if none
+    if not ids:
+        ids = _by_centroid(city)
+    # Strategy 3: tiny buffer on city to close microscopic gaps, then retry both
+    if not ids:
+        try:
+            city_b = city.copy()
+            city_b["geometry"] = city_b.geometry.buffer(0.0007)  # ~75m buffer
+            ids = _by_intersection(city_b) or _by_centroid(city_b)
+        except Exception:
+            pass
+
+    # Return subset of tract_df by id set
+    if not ids:
+        return tract_df.iloc[0:0].copy()  # empty with same columns
     return tract_df[tract_df["geoid_tract"].isin(ids)].copy()
+
 
 # ---------------------------
 # Wealth & Health helpers
@@ -412,14 +465,24 @@ if st.button("Load ACS & compute ADOS proxy"):
         if tracts is None or ados_df.empty:
             st.error("Tracts or ACS failed to load.")
         else:
-            # Limit to city tracts
+            # DEBUG: quick counts before selection
+            st.caption(f"Loaded tracts in county: {len(tracts):,} • ACS tract rows: {len(ados_df):,}")
+
+            # Limit to city tracts (robust)
             ados_city = subset_to_city_tracts(ados_df, tracts, city_gdf)
+
+            # DEBUG: how many tracts made it into the city set?
+            st.caption(f"Tracts intersecting city: {ados_city['geoid_tract'].nunique():,}")
+
             # City totals
-            city_native  = ados_city["native_black"].sum()
-            city_foreign = ados_city["foreign_black"].sum()
-            city_black   = ados_city["black_total"].sum()
+            city_native  = pd.to_numeric(ados_city["native_black"], errors="coerce").sum()
+            city_foreign = pd.to_numeric(ados_city["foreign_black"], errors="coerce").sum()
+            city_black   = pd.to_numeric(ados_city["black_total"], errors="coerce").sum()
             ados_share   = (city_native / city_black) if city_black > 0 else np.nan
 
+            if ados_city.empty or city_black == 0:
+                st.warning("No tracts selected for the city boundary (or Black total = 0). "
+                           "Try hitting 'Fetch boundary' again or verify County FIPS.")
             k1, k2, k3 = st.columns(3)
             k1.metric("U.S.-born Black residents (proxy)", f"{int(city_native):,}")
             k2.metric("Foreign-born Black residents", f"{int(city_foreign):,}")
