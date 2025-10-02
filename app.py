@@ -489,20 +489,3 @@ if ctx is not None and not ctx.empty:
 
 st.markdown("---")
 st.caption("Sources: Census TIGERweb (boundaries, tracts), Census ACS 5-year (B05003B, etc.), CDC PLACES (optional).")
-ALLOW_OSM_FALLBACK = st.sidebar.checkbox(
-    "If TIGERweb fails, allow OSM fallback", value=True,
-    help="If TIGERweb cannot find the place, we will try OpenStreetMap."
-)
-
-INCLUDE_PLACES = st.sidebar.checkbox(
-    "Include CDC PLACES uninsured metric (slower)", value=False,
-    help="Downloads ~100MB CSV; leave off if you just need the ACS-side prototypes."
-)
-
-st.sidebar.caption("Cloud tip: leave steps button-driven to avoid long cold starts.")
-st.sidebar.caption("Use Python 3.10 locally for the most stable geo stack.")
-
-# ---------------------------
-# Boundary helpers
-# ---------------------------
-@st.cache_data(show_spinner=True, ttl=60
