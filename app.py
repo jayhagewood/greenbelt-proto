@@ -488,7 +488,8 @@ if ctx is not None and not ctx.empty:
     )
 
 st.markdown("---")
-st.caption("Sources: Census TIGERweb (boundaries, tracts), Census ACS 5-year (B05003B, etc.), CDC PLACES (optional).")ALLOW_OSM_FALLBACK = st.sidebar.checkbox(
+st.caption("Sources: Census TIGERweb (boundaries, tracts), Census ACS 5-year (B05003B, etc.), CDC PLACES (optional).")
+ALLOW_OSM_FALLBACK = st.sidebar.checkbox(
     "If TIGERweb fails, allow OSM fallback", value=True,
     help="If TIGERweb cannot find the place, we will try OpenStreetMap."
 )
