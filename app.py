@@ -42,23 +42,65 @@ BOUNDARY_SOURCE = st.sidebar.selectbox(
 # Helpers
 # ---------------------------
 @st.cache_data(show_spinner=True, ttl=60*60*24)
-def get_city_boundary_from_overpass(place_name: str, contact_email="contact@example.com"):
+def get_city_boundary_from_census_places(place_name: str, state_fips: str):
+    """
+    Fetch a place boundary directly from the Census TIGERweb ArcGIS REST API (GeoJSON),
+    which avoids reading remote ZIP shapefiles (vsizip/vsicurl) that often fail on Cloud.
+
+    Returns a GeoDataFrame with CRS EPSG:4326 containing a single row (the best match).
+    """
+    import json
     gpd = _gpd()
-    _, shape = _shapely()
-    r = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={"q": place_name, "format": "json", "polygon_geojson": 1, "limit": 1},
-        headers={"User-Agent": f"ados-proto/1.0 ({contact_email})"},
-        timeout=60,
-    )
+
+    base = "https://tigerweb.geo.census.gov/arcgis/rest/services/" \
+           "TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer/2/query"
+
+    # Normalize inputs
+    state = str(state_fips).zfill(2)
+    name_token = place_name.split(",")[0].strip().replace("'", "''")  # escape single quotes
+
+    # First try exact (case-insensitive) name match
+    where = f"STATE='{state}' AND UPPER(NAME)=UPPER('{name_token}')"
+    params = {
+        "where": where,
+        "outFields": "*",
+        "f": "geojson",
+        "outSR": 4326,
+        "returnGeometry": "true",
+    }
+    r = requests.get(base, params=params, timeout=60)
     r.raise_for_status()
     j = r.json()
-    if not j: 
-        raise RuntimeError("No boundary found.")
-    gj = j[0]["geojson"]
-    gdf = gpd.GeoDataFrame({"name":[place_name]}, geometry=[shape(gj)], crs=4326)
+
+    # If nothing, try prefix LIKE
+    if not j.get("features"):
+        where_like = f"STATE='{state}' AND UPPER(NAME) LIKE UPPER('{name_token}%')"
+        params["where"] = where_like
+        r = requests.get(base, params=params, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+
+    if not j.get("features"):
+        raise RuntimeError(f"Census TIGERweb: no place found for '{place_name}' in state {state}.")
+
+    # Build GeoDataFrame from features
+    gdf = gpd.GeoDataFrame.from_features(j["features"], crs="EPSG:4326")
+
+    # Prefer 'city' type if multiple records (NAMELSAD often contains "city", "town", etc.)
+    if "NAMELSAD" in gdf.columns:
+        gdf["score"] = 0
+        gdf.loc[gdf["NAMELSAD"].str.contains("city", case=False, na=False), "score"] += 2
+        gdf.loc[gdf["NAME"].str.upper() == name_token.upper(), "score"] += 3
+        gdf = gdf.sort_values(["score", "NAME"], ascending=[False, True])
+
+    # Keep the best match
+    gdf = gdf.head(1).copy()
+    gdf["name"] = place_name
+    # Fix potential topology issues
     gdf["geometry"] = gdf["geometry"].buffer(0)
-    return gdf
+
+    return gdf[["name", "geometry"]].reset_index(drop=True)
+
 
 @st.cache_data(show_spinner=True, ttl=60*60*24)
 def get_city_boundary_from_census_places(place_name: str, state_fips: str):
