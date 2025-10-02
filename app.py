@@ -60,7 +60,9 @@ def get_city_boundary_from_tigerweb(place_name: str, state_fips: str):
     )
 
     state = str(state_fips).zfill(2)
-    token = place_name.split(",")[0].strip().replace("'", "''")
+    token = place_name.split(",")[0].strip()
+    token = token.replace(" city", "").replace(" town", "").replace(" village", "")
+    token = token.replace("'", "''")
 
     params = {
         "where": f"STATE='{state}' AND UPPER(NAME)=UPPER('{token}')",
